@@ -1,4 +1,5 @@
-name: megatron_gpt_peft_${model.peft.peft_scheme}_tuning
+#name: megatron_gpt_peft_${model.peft.peft_scheme}_tuning
+name: megatron_gpt_peft
 
 trainer:
   devices: 1
