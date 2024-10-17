@@ -185,68 +185,10 @@ def train_nemo(
     import hydra
     from omegaconf import OmegaConf
 
-#    with initialize(version_base=None, config_path="../config", job_name="megatron_gpt_finetuning_config"):
-#        cfg = compose(config_name="megatron_gpt_peft_finetuning_config", overrides=["db=mysql", "db.user=me"])
-#        print(OmegaConf.to_yaml(cfg))
-
-
     hydra.initialize(config_path="../config", job_name="megatron_gpt_finetuning")
     
     # Load the configuration
     cfg = hydra.compose(config_name="megatron_gpt_finetuning")
-
-
-    if not input_dir:
-        # By default, generate output-dir is used as train input-dir
-        input_dir = ctx.obj.config.generate.output_dir
-
-    if four_bit_quant and device.type != "cuda":
-        ctx.fail("--4-bit-quant option requires --device=cuda")
-
-    effective_data_dir = Path(data_dir or "./taxonomy_data")
-    train_file = effective_data_dir / "train_gen.jsonl"
-    test_file = effective_data_dir / "test_gen.jsonl"
-
-    # NOTE: If given a data_dir, input-dir is ignored in favor of existing!
-    if data_dir is None:
-        data_dir = effective_data_dir
-        if not os.path.exists(input_dir):
-            click.secho(
-                f"Could not read directory: {input_dir}",
-                fg="red",
-            )
-            raise click.exceptions.Exit(1)
-
-        try:
-            os.makedirs(data_dir, exist_ok=True)
-        except OSError as exc:
-            click.secho(
-                f"Could not create data dir: {exc}",
-                fg="red",
-            )
-            raise click.exceptions.Exit(1)
-
-        # generated input files reverse sorted by name (contains timestamp)
-        def get_files(pattern):
-            return sorted(Path(input_dir).glob(pattern), reverse=True)
-
-        train_files = get_files("train_*")
-        test_files = get_files("test_*")
-
-        if not train_files or not test_files:
-            click.secho(
-                f"{input_dir} does not contain training or test files, did you run `ilab generate`?",
-                fg="red",
-            )
-            raise click.exceptions.Exit(1)
-        if len(train_files) > 1 or len(test_files) > 1:
-            click.secho(
-                "Found multiple files from `ilab generate`. Using the most recent generation.",
-                fg="yellow",
-            )
-        # First file is latest (by above reverse sort and timestamped names)
-        shutil.copy(train_files[0], train_file)
-        shutil.copy(test_files[0], test_file)
 
     # pylint: disable=import-outside-toplevel
     if not utils.is_macos_with_m_chip():
@@ -254,6 +196,7 @@ def train_nemo(
         # from ..llamacpp.llamacpp_convert_to_gguf import convert_llama_to_gguf
         # from ..train.linux_train import linux_train
         from nemo.collections.nlp.parts.megatron_trainer_builder import MegatronLMPPTrainerBuilder
+        from nemo.collections.nlp.models.language_modeling.megatron_gpt_sft_model import MegatronGPTSFTModel
         from nemo.utils.exp_manager import exp_manager
 
         logging.info("\n\n************** Experiment configuration ***********")
@@ -261,4 +204,21 @@ def train_nemo(
 
         trainer = MegatronLMPPTrainerBuilder(cfg).create_trainer()
         exp_manager(trainer, cfg.exp_manager)
+
+        model_cfg = MegatronGPTSFTModel.merge_cfg_with(cfg.model.restore_from_path, cfg)
+        model = MegatronGPTSFTModel.restore_from(cfg.model.restore_from_path, model_cfg, trainer=trainer)
+        peft_cfg_cls = PEFT_CONFIG_MAP[cfg.model.peft.peft_scheme]
+
+        if cfg.model.peft.restore_from_path is not None:
+            # initialize peft weights from a checkpoint instead of randomly
+            # This is not the same as resume training because optimizer states are not restored.
+            logging.info("PEFT Weights will be loaded from", cfg.model.peft.restore_from_path)
+            model.load_adapters(cfg.model.peft.restore_from_path, peft_cfg_cls(model_cfg))
+        elif peft_cfg_cls is not None:
+            logging.info("Adding adapter weights to the model for PEFT")
+            model.add_adapter(peft_cfg_cls(model_cfg))
+        else:
+           logging.info(f"Running full finetuning since no peft scheme is given.\n{model.summarize()}")
+
+        trainer.fit(model)
 
